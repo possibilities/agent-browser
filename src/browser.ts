@@ -917,17 +917,6 @@ export class BrowserManager {
     lease: string,
     baseUrl: string
   ): Promise<void> {
-    // Optionally save profile before release
-    if (process.env.BROWSER_FARM_SAVE_PROFILE === 'true') {
-      await fetch(`${baseUrl}/api/browsers/${browserId}/save-profile`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lease }),
-      }).catch((err) => {
-        console.error('Failed to save browser-farm profile:', err);
-      });
-    }
-
     const response = await fetch(`${baseUrl}/api/browsers/${browserId}/release`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
