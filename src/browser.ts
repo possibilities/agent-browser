@@ -103,6 +103,9 @@ export class BrowserManager {
   private browserUseApiKey: string | null = null;
   private kernelSessionId: string | null = null;
   private kernelApiKey: string | null = null;
+  private browserFarmId: string | null = null;
+  private browserFarmLease: string | null = null;
+  private browserFarmUrl: string | null = null;
   private contexts: BrowserContext[] = [];
   private pages: Page[] = [];
   private activePageIndex: number = 0;
@@ -907,6 +910,36 @@ export class BrowserManager {
   }
 
   /**
+   * Release a browser-farm browser via API
+   */
+  private async releaseBrowserFarm(
+    browserId: string,
+    lease: string,
+    baseUrl: string
+  ): Promise<void> {
+    // Optionally save profile before release
+    if (process.env.BROWSER_FARM_SAVE_PROFILE === 'true') {
+      await fetch(`${baseUrl}/api/browsers/${browserId}/save-profile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lease }),
+      }).catch((err) => {
+        console.error('Failed to save browser-farm profile:', err);
+      });
+    }
+
+    const response = await fetch(`${baseUrl}/api/browsers/${browserId}/release`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lease }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to release browser-farm browser: ${response.statusText}`);
+    }
+  }
+
+  /**
    * Connect to Browserbase remote browser via CDP.
    * Requires BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID environment variables.
    */
@@ -1189,6 +1222,109 @@ export class BrowserManager {
   }
 
   /**
+   * Connect to browser-farm remote browser via CDP.
+   * Uses BROWSER_FARM_URL env var (default: http://browserfarm:7600).
+   * No API key needed - browser-farm runs on a private Tailscale network.
+   */
+  private async connectToBrowserFarm(): Promise<void> {
+    const baseUrl = process.env.BROWSER_FARM_URL || 'http://browserfarm:7600';
+
+    const response = await fetch(`${baseUrl}/api/browsers/acquire`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(
+        `Failed to acquire browser from browser-farm: ${response.statusText}` +
+          ((body as { message?: string }).message
+            ? ` - ${(body as { message?: string }).message}`
+            : '')
+      );
+    }
+
+    let result: {
+      ok: boolean;
+      data: {
+        id: string;
+        lease: string;
+        cdp: {
+          ws_endpoint: string;
+          http_endpoint: string;
+          port: number;
+        };
+        vnc_port: number;
+        workspace: number;
+      };
+    };
+    try {
+      result = (await response.json()) as typeof result;
+    } catch (error) {
+      throw new Error(
+        `Failed to parse browser-farm acquire response: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    if (!result.ok || !result.data?.id || !result.data?.lease || !result.data?.cdp?.http_endpoint) {
+      throw new Error(
+        `Invalid browser-farm acquire response: missing ${!result.data?.id ? 'id' : !result.data?.lease ? 'lease' : 'cdp.http_endpoint'}`
+      );
+    }
+
+    const { id, lease, cdp } = result.data;
+
+    let browser: Browser;
+    try {
+      browser = await chromium.connectOverCDP(cdp.http_endpoint);
+    } catch {
+      await this.releaseBrowserFarm(id, lease, baseUrl).catch((releaseError) => {
+        console.error(
+          'Failed to release browser-farm browser after CDP connect failure:',
+          releaseError
+        );
+      });
+      throw new Error(
+        `Failed to connect to browser-farm browser ${id} via CDP at ${cdp.http_endpoint}`
+      );
+    }
+
+    try {
+      const contexts = browser.contexts();
+      let context: BrowserContext;
+      let page: Page;
+
+      if (contexts.length === 0) {
+        context = await browser.newContext();
+        page = await context.newPage();
+      } else {
+        context = contexts[0];
+        const pages = context.pages();
+        page = pages[0] ?? (await context.newPage());
+      }
+
+      this.browserFarmId = id;
+      this.browserFarmLease = lease;
+      this.browserFarmUrl = baseUrl;
+      this.browser = browser;
+      context.setDefaultTimeout(getDefaultTimeout());
+      this.contexts.push(context);
+      this.setupContextTracking(context);
+      await this.ensureDomainFilter(context);
+      await this.sanitizeExistingPages([page]);
+      this.pages.push(page);
+      this.activePageIndex = 0;
+      this.setupPageTracking(page);
+    } catch (error) {
+      await this.releaseBrowserFarm(id, lease, baseUrl).catch((releaseError) => {
+        console.error('Failed to release browser-farm browser during cleanup:', releaseError);
+      });
+      throw error;
+    }
+  }
+
+  /**
    * Launch the browser with the specified options
    * If already launched, this is a no-op (browser stays open)
    */
@@ -1289,6 +1425,10 @@ export class BrowserManager {
     // Kernel: requires explicit opt-in via -p kernel flag or AGENT_BROWSER_PROVIDER=kernel
     if (provider === 'kernel') {
       await this.connectToKernel();
+      return;
+    }
+    if (provider === 'browserfarm') {
+      await this.connectToBrowserFarm();
       return;
     }
 
@@ -2520,6 +2660,15 @@ export class BrowserManager {
         console.error('Failed to close Kernel session:', error);
       });
       this.browser = null;
+    } else if (this.browserFarmId && this.browserFarmLease && this.browserFarmUrl) {
+      await this.releaseBrowserFarm(
+        this.browserFarmId,
+        this.browserFarmLease,
+        this.browserFarmUrl
+      ).catch((error) => {
+        console.error('Failed to release browser-farm browser:', error);
+      });
+      this.browser = null;
     } else if (this.cdpEndpoint !== null) {
       // CDP: only disconnect, don't close external app's pages
       if (this.browser) {
@@ -2549,6 +2698,9 @@ export class BrowserManager {
     this.browserUseApiKey = null;
     this.kernelSessionId = null;
     this.kernelApiKey = null;
+    this.browserFarmId = null;
+    this.browserFarmLease = null;
+    this.browserFarmUrl = null;
     this.isPersistentContext = false;
     this.activePageIndex = 0;
     this.colorScheme = null;
